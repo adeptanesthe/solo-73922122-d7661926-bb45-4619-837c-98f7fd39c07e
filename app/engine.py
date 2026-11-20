@@ -17,6 +17,18 @@ Design contract
   provides the ground truth for loss, gradient and post-update weights.
 * Mini-batch splitting is mathematically neutral; the engine verifies it
   empirically for splits into 1..4 micro-batches.
+
+Per-sample L2 gradient clipping (second, independent comparison)
+----------------------------------------------------------------
+* 每个 token 对额外携带一个样本号；同一样本号可跨微批。
+* 每个样本的梯度 = 该样本全部有效 token 的平均交叉熵对共享 W 的梯度
+  （嵌入与投影两路合并后的完整 dW），按完整样本计算，与微批划分无关。
+* 样本梯度 L2 范数超过正数上限 C 时等比缩放到 C，否则不变。
+* 全忽略样本（目标全为 -100）不参与平均；没有有效样本则拒绝运行。
+* 对裁剪后的样本梯度取平均，只做一步 SGD（lr = 0.01）。
+* 分块路径的投影临时张量词表轴仍 <= 128：按块重算、按块累加 dW，
+  不组装 [tokens, vocab] 的整词表梯度；逐样本处理、即算即并入平均，
+  不同时保留多个样本的梯度。
 """
 
 from __future__ import annotations
@@ -566,3 +578,317 @@ def evaluate(payload: dict) -> dict:
             "recompute_in_backward": True,
         },
     }
+
+
+# ===========================================================================
+# 按样本 L2 梯度裁剪对照（独立的新增对照，不改变上面的原始对照）
+# ===========================================================================
+@dataclass(frozen=True)
+class ClipMicroBatch:
+    """A micro-batch whose token pairs each carry a sample id."""
+
+    name: str
+    sample_ids: Tuple[int, ...]
+    input_ids: Tuple[int, ...]
+    target_ids: Tuple[int, ...]
+
+
+@dataclass
+class ClipRunSpec:
+    microbatches: List[ClipMicroBatch]
+    vocab_size: int
+    seed: int
+    scale: float
+    clip_norm: float
+
+
+def parse_clip_payload(p: dict) -> ClipRunSpec:
+    """Parse and validate the per-sample L2-clipping payload.
+
+    Every ``tokens`` entry is ``[样本号, 输入号, 目标号]``; ``clip_norm`` must
+    be a positive finite number.  At least one *valid* sample (a sample with
+    at least one non-``-100`` target) is required, otherwise the run is
+    refused and no update happens.
+    """
+    _require(isinstance(p, dict), "请求体必须是 JSON 对象")
+    allowed = {"seed", "scale", "vocab_size", "clip_norm", "microbatches", "tokens"}
+    unknown = sorted(set(p) - allowed)
+    _require(not unknown, f"未知字段：{', '.join(unknown)}")
+
+    seed = _as_int("seed", p.get("seed", 0))
+    _require(0 <= seed <= MAX_SEED, f"seed 必须在 [0, {MAX_SEED}] 内")
+
+    scale = _as_float("scale", p.get("scale", 1.0))
+    _require(
+        MIN_SCALE <= scale <= MAX_SCALE,
+        f"权重倍率 scale 必须在 [{MIN_SCALE}, {MAX_SCALE}] 内",
+    )
+
+    vocab_size = _as_int("vocab_size", p.get("vocab_size", MIN_VOCAB))
+    _require(
+        MIN_VOCAB <= vocab_size <= MAX_VOCAB,
+        f"词表大小 vocab_size 必须在 [{MIN_VOCAB}, {MAX_VOCAB}] 内",
+    )
+
+    _require("clip_norm" in p, "缺少 clip_norm：请提供正的 L2 裁剪上限")
+    clip_norm = _as_float("clip_norm", p["clip_norm"])
+    _require(clip_norm > 0, "L2 裁剪上限 clip_norm 必须是正数")
+
+    rawbatches = p.get("microbatches")
+    if rawbatches is None and "tokens" in p:
+        rawbatches = [{"name": "mb1", "tokens": p["tokens"]}]
+    _require(
+        isinstance(rawbatches, list) and len(rawbatches) >= 1,
+        "至少需要 1 个微批（microbatches 不能为空）",
+    )
+    _require(
+        len(rawbatches) <= MAX_MICROBATCHES,
+        f"微批数量不能超过 {MAX_MICROBATCHES} 个",
+    )
+
+    batches: List[ClipMicroBatch] = []
+    total = 0
+    for idx, raw in enumerate(rawbatches):
+        _require(isinstance(raw, dict), f"第 {idx + 1} 个微批必须是对象")
+        name = str(raw.get("name") or f"mb{idx + 1}").strip() or f"mb{idx + 1}"
+        pairs = raw.get("tokens")
+        _require(
+            isinstance(pairs, list) and len(pairs) >= 1,
+            f"微批 {name!r} 至少需要一组 [样本号, 输入号, 目标号]",
+        )
+        sids: List[int] = []
+        inputs: List[int] = []
+        targets: List[int] = []
+        for pair in pairs:
+            _require(
+                isinstance(pair, (list, tuple)) and len(pair) == 3,
+                f"微批 {name!r}: 每一项必须是 [样本号, 输入号, 目标号]",
+            )
+            sid = _as_int("样本号", pair[0])
+            _require(sid >= 0, f"微批 {name!r}: 样本号 {sid} 不能为负数")
+            inp = _as_int("输入 token 号", pair[1])
+            tgt = _as_int("目标 token 号", pair[2])
+            _require(
+                0 <= inp < vocab_size,
+                f"微批 {name!r}: 输入号 {inp} 超出词表 [0, {vocab_size})",
+            )
+            _require(
+                tgt == IGNORE_INDEX or 0 <= tgt < vocab_size,
+                f"微批 {name!r}: 目标号 {tgt} 必须为 {IGNORE_INDEX} "
+                f"或位于 [0, {vocab_size})",
+            )
+            sids.append(sid)
+            inputs.append(inp)
+            targets.append(tgt)
+        total += len(sids)
+        _require(
+            total <= MAX_TOTAL_TOKENS,
+            f"全部微批的 token 总数（含忽略项）不能超过 {MAX_TOTAL_TOKENS}",
+        )
+        batches.append(
+            ClipMicroBatch(
+                name=name,
+                sample_ids=tuple(sids),
+                input_ids=tuple(inputs),
+                target_ids=tuple(targets),
+            )
+        )
+
+    _require(total >= MIN_TOTAL_TOKENS, "至少需要 1 个 token")
+    _require(
+        any(t != IGNORE_INDEX for b in batches for t in b.target_ids),
+        "没有有效样本：所有样本的目标都被 -100 忽略，已拒绝本次运行，权重不做任何更新",
+    )
+    return ClipRunSpec(
+        microbatches=batches,
+        vocab_size=vocab_size,
+        seed=seed,
+        scale=scale,
+        clip_norm=clip_norm,
+    )
+
+
+@dataclass
+class ClipSampleInfo:
+    """Per-run information for one valid sample."""
+
+    sample_id: int
+    token_count: int
+    valid_tokens: int
+    loss: float
+    grad_norm: float  # 裁剪前 L2 范数（嵌入+投影两路合并后的完整 dW）
+    clipped: bool
+    scale_factor: float  # 实际乘上的系数（未裁剪时为 1.0）
+
+
+@dataclass
+class ClipRunResult:
+    grad: torch.Tensor  # 裁剪后样本梯度的平均
+    updated_weight: torch.Tensor
+    base_weight: torch.Tensor
+    samples: List[ClipSampleInfo]
+    ignored_sample_ids: List[int]
+    valid_tokens: int
+    token_count: int
+    saved_shapes: List[List[list]] = field(default_factory=list)
+
+
+def _group_by_sample(
+    batches: List[ClipMicroBatch],
+) -> "dict[int, Tuple[List[int], List[int]]]":
+    """Group (input, target) pairs by sample id, preserving stream order.
+
+    同一样本号可跨微批；按首次出现顺序排列样本，样本内保持 token 顺序，
+    因此结果与微批划分方式无关。
+    """
+    groups: "dict[int, Tuple[List[int], List[int]]]" = {}
+    for mb in batches:
+        for sid, inp, tgt in zip(mb.sample_ids, mb.input_ids, mb.target_ids):
+            entry = groups.get(sid)
+            if entry is None:
+                entry = ([], [])
+                groups[sid] = entry
+            entry[0].append(inp)
+            entry[1].append(tgt)
+    return groups
+
+
+def _clip_factor(norm: float, clip_norm: float) -> Tuple[float, bool]:
+    """Return ``(scale_factor, clipped)`` for one sample gradient."""
+    if norm > clip_norm:
+        return clip_norm / norm, True
+    return 1.0, False
+
+
+def run_clipped_chunked(spec: ClipRunSpec) -> ClipRunResult:
+    """Chunked per-sample clipping run on one shared initial ``W``.
+
+    每个有效样本独立地：前向（分块 logsumexp）→ 反向（重算，词表轴 ≤ 128）
+    得到完整 dW（嵌入+投影两路合并）→ 超限则等比缩到上限 → 立即并入平均；
+    不组装 [tokens, vocab] 的整词表梯度，也不同时保留多个样本的梯度。
+    """
+    weight = make_weight(spec.vocab_size, spec.seed, spec.scale).requires_grad_(True)
+
+    groups = _group_by_sample(spec.microbatches)
+    valid = {
+        sid: et
+        for sid, et in groups.items()
+        if any(t != IGNORE_INDEX for t in et[1])
+    }
+    if not valid:
+        raise ValidationError(
+            "没有有效样本：所有样本的目标都被 -100 忽略，已拒绝运行，权重不做任何更新"
+        )
+    ignored = [sid for sid in groups if sid not in valid]
+
+    n_samples = len(valid)
+    total = torch.zeros_like(weight)
+    infos: List[ClipSampleInfo] = []
+    saved: List[List[list]] = []
+    previous = getattr(_SAVED_SHAPES, "value", None)
+    _SAVED_SHAPES.value = []
+    try:
+        for sid, (inputs, targets) in valid.items():
+            vcount = sum(1 for t in targets if t != IGNORE_INDEX)
+            weight.grad = None
+            idx = torch.tensor(inputs, dtype=torch.long)
+            tgt = torch.tensor(targets, dtype=torch.long)
+            hidden = weight.index_select(0, idx)
+            loss = ChunkedSoftmaxLoss.apply(weight, hidden, tgt)
+            loss.backward()
+            g = weight.grad.detach().clone()
+            norm = float(g.norm().item())
+            factor, clipped = _clip_factor(norm, spec.clip_norm)
+            total.add_(g, alpha=factor)
+            infos.append(
+                ClipSampleInfo(
+                    sample_id=sid,
+                    token_count=len(inputs),
+                    valid_tokens=vcount,
+                    loss=float(loss.item()),
+                    grad_norm=norm,
+                    clipped=clipped,
+                    scale_factor=factor,
+                )
+            )
+        saved = _SAVED_SHAPES.value
+    finally:
+        _SAVED_SHAPES.value = previous
+
+    grad = total / n_samples
+    with torch.no_grad():
+        updated = weight.detach().clone()
+        updated -= LEARNING_RATE * grad
+
+    return ClipRunResult(
+        grad=grad,
+        updated_weight=updated,
+        base_weight=weight.detach().clone(),
+        samples=infos,
+        ignored_sample_ids=ignored,
+        valid_tokens=sum(i.valid_tokens for i in infos),
+        token_count=sum(len(mb.input_ids) for mb in spec.microbatches),
+        saved_shapes=saved,
+    )
+
+
+def dense_clip_reference(cspec):
+    base = make_weight(cspec.vocab_size, cspec.seed, cspec.scale)
+    groups = _group_by_sample(cspec.microbatches)
+    valid = [
+        (sid, et)
+        for sid, et in groups.items()
+        if any(t != -100 for t in et[1])
+    ]
+    if not valid:
+        raise ValidationError(
+            "没有有效样本：所有样本的目标都被 -100 忽略，已拒绝运行，权重不做任何更新"
+        )
+    n = len(valid)
+    total = torch.zeros_like(base)
+    info = []
+    for sid, (inputs, targets) in valid:
+        w = base.detach().clone().requires_grad_(True)
+        idx = torch.tensor(inputs, dtype=torch.long)
+        tgt = torch.tensor(targets, dtype=torch.long)
+        mask = tgt != -100
+        hidden = w.index_select(0, idx)
+        logits = hidden @ w.t()
+        lp = torch.log_softmax(logits, dim=1)
+        picked = lp.gather(1, tgt.clamp_min(0).unsqueeze(1)).squeeze(1)
+        loss = -picked[mask].mean()
+        loss.backward()
+        g = w.grad.detach().clone()
+        norm = float(g.norm())
+        factor, _ = _clip_factor(norm, cspec.clip_norm)
+        total += g * factor
+        info.append((sid, float(loss), norm, factor))
+    grad = total / n
+    return grad, info
+
+
+def cleft_split_spec(cspec, parts):
+    """把同一 (样本号, 输入号, 目标号) 流重新均分为 parts 个微批。"""
+    flat = [
+        (sid, inp, tgt)
+        for mb in cspec.microbatches
+        for sid, inp, tgt in zip(mb.sample_ids, mb.input_ids, mb.target_ids)
+    ]
+    groups = _even_groups(len(flat), parts)
+    batches = []
+    for i, g in enumerate(groups):
+        batches.append(
+            ClipMicroBatch(
+                name=f"split{parts}-{i + 1}",
+                sample_ids=tuple(flat[j][0] for j in g),
+                input_ids=tuple(flat[j][1] for j in g),
+                target_ids=tuple(flat[j][2] for j in g),
+            )
+        )
+    return ClipRunSpec(
+        microbatches=batches,
+        vocab_size=cspec.vocab_size,
+        seed=cspec.seed,
+        scale=cspec.scale,
+        clip_norm=cspec.clip_norm,
+    )
